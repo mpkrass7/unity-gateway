@@ -32,6 +32,7 @@ from ucode.agents import (
     provider_permission_error,
     resolve_gemini_provider_model,
     resolve_launch_model,
+    resolve_managed_for_tool,
     resolve_provider_models,
     validate_all_tools,
     validate_tool,
@@ -119,6 +120,7 @@ from ucode.skills_download import (
 from ucode.smart_routing import v2 as smart_routing_v2
 from ucode.smart_routing.claude_hooks import FIRST_PROMPT_SOCKET_ENV, ROUTE_FIRST_PROMPT_EVENT
 from ucode.state import (
+    MANAGED_OVERLAY_KEY,
     STATE_PATH,
     clear_state,
     get_provider_service,
@@ -556,11 +558,11 @@ def configure_shared_state(
         profile = find_profile_name_for_host(workspace)
         if profile:
             state["profile"] = profile
-    with spinner("Verifying Unity AI Gateway..."):
+    with spinner("Verifying Unity Gateway..."):
         token = get_databricks_token(workspace, profile)
         model_service_probe = probe_unity_gateway_capabilities(workspace, token)
     if model_service_probe.resource_available:
-        print_success("Unity AI Gateway connected")
+        print_success("Unity Gateway connected")
     else:
         print_warning(f"Model service: {model_service_probe.detail}")
 
@@ -798,7 +800,9 @@ def configure_workspace_command(
             clear_custom_oauth=custom_oauth is None,
         )
         state = states[0]
-        state = configure_single_tool(tool, state)
+        # Fetch and apply managed config so configure respects the admin's policy
+        managed, _ = _fetch_managed_config(state)
+        state = configure_single_tool(tool, state, managed=managed)
         install_databricks_ai_tools_for_agents([tool], state)
         spec = TOOL_SPECS[tool]
         console.print(
@@ -814,14 +818,17 @@ def configure_workspace_command(
         if skip_validate:
             print_note(f"Skipping {spec['display']} validation (--skip-validate).")
             return 0
+        # Validate against the effective managed-resolved config (with a displaced provider
+        # cleared), not the overlay-stripped persisted state.
+        validate_state = resolve_managed_for_tool(managed, state, tool)
         with spinner(f"Validating {spec['display']}..."):
-            ok, err = validate_tool(tool)
+            ok, err = validate_tool(tool, state=validate_state)
         if ok:
             print_success(f"{spec['display']} is working")
         else:
             print_err(f"{spec['display']}: {provider_permission_error(tool, state, err)}")
-            managed = bool(state.get("managed_configs", {}).get(tool))
-            restore_file(spec["config_path"], spec["backup_path"], managed)
+            managed_flag = bool(state.get("managed_configs", {}).get(tool))
+            restore_file(spec["config_path"], spec["backup_path"], managed_flag)
             available_tools = [t for t in (state.get("available_tools") or []) if t != tool]
             state["available_tools"] = available_tools
             save_state(state)
@@ -839,13 +846,27 @@ def configure_workspace_command(
         clear_custom_oauth=custom_oauth is None,
     )
     state = states[0]
+    # Fetch managed config early so it can be passed to configure functions
+    managed, _ = _fetch_managed_config(state)
     save_state(state)
 
+    # A managed config's enabled_agents is an allowlist, enforced at launch by
+    # _reject_disabled_agent. With no explicit --agents, honor it here too: configure exactly the
+    # enabled agents rather than prompting across every workspace-available one. Passing managed to
+    # the availability check also lets an agent with managed-only models (none discovered) count.
+    managed_enabled = managed_enabled_tools(managed or {})
+    auto_managed = selected_tools is None and bool(managed_enabled)
+
     available_on_workspace: list[str] = []
-    tools_to_check = selected_tools or list(TOOL_SPECS)
+    if selected_tools is not None:
+        tools_to_check = selected_tools
+    elif auto_managed:
+        tools_to_check = managed_enabled
+    else:
+        tools_to_check = list(TOOL_SPECS)
     for tool_name in tools_to_check:
         with spinner(f"Checking {TOOL_SPECS[tool_name]['display']} availability..."):
-            if check_gateway_endpoint(state, tool_name):
+            if check_gateway_endpoint(state, tool_name, managed=managed):
                 available_on_workspace.append(tool_name)
 
     if not available_on_workspace:
@@ -853,7 +874,19 @@ def configure_workspace_command(
         _print_discovery_diagnostics(state)
         return 1
 
-    if selected_tools is None:
+    if auto_managed:
+        unavailable_enabled = [t for t in managed_enabled if t not in available_on_workspace]
+        if unavailable_enabled:
+            _print_discovery_diagnostics(state)
+            displays = ", ".join(TOOL_SPECS[t]["display"] for t in unavailable_enabled)
+            print_warning(f"Managed config enables agent(s) not available here: {displays}.")
+        picked = available_on_workspace
+        print_note(
+            "Configuring the agents your workspace's managed config enables: "
+            + ", ".join(TOOL_SPECS[t]["display"] for t in picked)
+            + "."
+        )
+    elif selected_tools is None:
         picked = prompt_for_tools([(t, TOOL_SPECS[t]["display"]) for t in available_on_workspace])
     else:
         unavailable_tools = [
@@ -884,16 +917,19 @@ def configure_workspace_command(
             prompt_optional_updates=prompt_optional_updates,
         )
 
-    # Offer the provider picker for the chosen claude/codex tools only on the
-    # interactive path (no --agents); otherwise stay on the Databricks path.
+    # Offer the provider picker for the chosen claude/codex tools only on the interactive path (no
+    # --agents); otherwise stay on the Databricks path. Skip it for any tool whose model source the
+    # managed config already dictates, since a picked provider would only be overridden at launch.
     if offer_provider:
         for tool_name in picked:
+            if managed is not None and managed_supplies_models(managed, tool_name):
+                continue
             state = _maybe_select_provider_service(tool_name, state)
 
     if offer_optional_setup:
-        state = configure_selected_tools(state, picked, install_ai_tools=False)
+        state = configure_selected_tools(state, picked, install_ai_tools=False, managed=managed)
     else:
-        state = configure_selected_tools(state, picked)
+        state = configure_selected_tools(state, picked, managed=managed)
 
     summary_lines = [f"[bold]Workspace:[/bold] [cyan]{state['workspace']}[/cyan]"]
     for tool_name in picked:
@@ -917,7 +953,7 @@ def configure_workspace_command(
         # Limit validation to just-configured tools so we don't re-validate
         # previously-configured tools the user didn't touch this run.
         validate_state = {**state, "available_tools": picked}
-        validate_all_tools(validate_state)
+        validate_all_tools(validate_state, managed)
     if offer_optional_setup and not is_dry_run():
         _configure_optional_setup(state, picked)
     return 0
@@ -1773,14 +1809,15 @@ def _reject_disabled_agent(managed: dict | None, tool: str) -> None:
         )
 
 
-def _fetch_managed_config(state: dict) -> ManagedConfigResult:
+def _fetch_managed_config(state: dict, *, force: bool = False) -> ManagedConfigResult:
     """The workspace's managed config for this launch, plus whether the feature is disabled.
 
     ``ManagedConfigResult(None, True)`` when the workspace has the feature disabled server-side;
-    ``ManagedConfigResult(None, False)`` when the feature is on but no config is published.
+    ``ManagedConfigResult(None, False)`` when the feature is on but no config is published. ``force``
+    bypasses the refresh TTL so ``--refresh`` always re-reads the workspace.
     """
     with spinner("Loading..."):
-        return refresh_managed_config(state)
+        return refresh_managed_config(state, force=force)
 
 
 def _note_recommended_agent(recommendation: dict | None, tool: str) -> None:
@@ -2016,7 +2053,9 @@ def _launch_tool(
         # control-plane round trip and any fallback warning it printed.
         coding_agent_config_feature_disabled = False
         if managed is None:
-            managed, coding_agent_config_feature_disabled = _fetch_managed_config(state)
+            managed, coding_agent_config_feature_disabled = _fetch_managed_config(
+                state, force=refresh
+            )
         # Checked before discovery, which can take tens of seconds, so a blocked launch fails fast.
         _reject_disabled_agent(managed, tool)
         # Discovery exists to find models and isn't needed for managed config that already names them.
@@ -2066,6 +2105,26 @@ def _launch_tool(
                 )
             if managed_provider:
                 provider = managed_provider
+            elif managed_supplies_models(managed, tool):
+                # The managed config names its own model source, so an explicit --provider conflicts
+                # with it and a persisted provider is cleared to let the managed source drive the
+                # picker/catalog.
+                if explicit_provider:
+                    raise RuntimeError(
+                        f"You cannot launch {TOOL_SPECS[tool]['display']} with provider "
+                        f"{explicit_provider} because your admin's managed config specifies its "
+                        f"own model source."
+                    )
+                provider = None
+                # Clear the provider for this launch so every agent honors the managed source,
+                # including ones (e.g. Gemini) that re-read get_provider_service. Record the
+                # developer's own provider in the managed overlay so save_state restores it: the
+                # clear is launch-scoped and the developer's saved provider survives as a fallback
+                # if the managed policy later disappears.
+                overlay = dict(state.get(MANAGED_OVERLAY_KEY) or {})
+                overlay.setdefault("provider_services", state.get("provider_services"))
+                state = set_provider_service(state, tool, None)
+                state[MANAGED_OVERLAY_KEY] = overlay
         # Checked after the managed config settles `provider`: an admin-set provider must trip this
         # guard too, or routing would be persisted as on while a provider is active.
         if tool in CAN_USE_CACHED_CONFIG_AGENTS and smart_routing_enabled and provider:

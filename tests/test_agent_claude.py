@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -226,6 +227,33 @@ class TestRenderOverlay:
         overlay, _ = claude.render_overlay(WS, "s4")
         assert "apiKeyHelper" in overlay
         assert WS in overlay["apiKeyHelper"]
+
+    def test_sets_custom_oauth_api_key_helper(self, monkeypatch):
+        from ucode import custom_oauth
+
+        monkeypatch.setattr("ucode.databricks._ucode_binary", lambda: "/opt/ucode")
+        monkeypatch.setattr(custom_oauth.platform, "system", lambda: "Linux")
+        overlay, _ = claude.render_overlay(
+            WS,
+            "s4",
+            custom_oauth={
+                "client_id": "custom-client",
+                "redirect_url": "http://localhost:8020/callback",
+                "scopes": ["offline_access", "model-serving"],
+            },
+        )
+        assert shlex.split(overlay["apiKeyHelper"]) == [
+            "/opt/ucode",
+            "auth-token",
+            "--host",
+            WS,
+            "--client-id",
+            "custom-client",
+            "--redirect-url",
+            "http://localhost:8020/callback",
+            "--scopes",
+            "offline_access,model-serving",
+        ]
 
     def test_relayed_omits_api_key_helper(self):
         # Claude Code's own subscription OAuth must own Authorization; an
@@ -738,6 +766,8 @@ class TestWriteToolConfigManagedSettings:
         # Private file still written; managed file written too.
         assert str(claude.CLAUDE_SETTINGS_PATH) in [p for p, _ in private_writes]
         assert [p for p, _ in managed_writes] == [str(FAKE_MANAGED_PATH)]
+        assert "modelPicker" not in private_writes[0][1]
+        assert "modelPicker" not in json.loads(managed_writes[0][1])
 
     def test_managed_file_preserves_other_keys(self, monkeypatch):
         private_writes: list = []
@@ -752,6 +782,33 @@ class TestWriteToolConfigManagedSettings:
         assert written["env"]["MY_OWN"] == "keep"
         assert written["env"]["ANTHROPIC_BASE_URL"]
         assert written["apiKeyHelper"]
+
+    def test_managed_file_updates_gateway_settings_without_changing_model_picker(self, monkeypatch):
+        private_writes: list = []
+        managed_writes: list = []
+        picker = {
+            "replaceBuiltInOptions": True,
+            "options": [
+                {"model": "system.ai.claude-opus-4-8"},
+                {"model": "system.ai.glm-5-2"},
+            ],
+        }
+        existing = {
+            str(FAKE_MANAGED_PATH): {
+                "modelPicker": picker,
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://old-workspace.databricks.com/ai-gateway/anthropic"
+                },
+            }
+        }
+        self._patch(monkeypatch, private_writes, managed_writes, existing)
+        state = {"workspace": WS, "codex_models": []}
+
+        claude.write_tool_config(state, "databricks-claude-sonnet-4")
+
+        written = json.loads(managed_writes[0][1])
+        assert written["modelPicker"] == picker
+        assert written["env"]["ANTHROPIC_BASE_URL"] == f"{WS}/ai-gateway/anthropic"
 
     def test_managed_file_strips_stale_gateway_model_discovery(self, monkeypatch):
         private_writes: list = []
@@ -1486,3 +1543,45 @@ class TestClaudeSmartRouting:
         assert state.get(claude.SMART_ROUTING_STATE_KEY) is None
         assert list(doc["hooks"]) == ["PreToolUse"]
         assert doc["hooks"]["PreToolUse"][0]["hooks"][0]["command"] == "user-policy"
+
+
+class TestEnsureSubscriptionLogin:
+    """Relayed launch's subscription-login gate."""
+
+    @staticmethod
+    def _forbid_subprocess(monkeypatch):
+        """Fail loudly if the CLI is shelled out to at all (status probe or login)."""
+
+        def _boom(*args, **kwargs):
+            raise AssertionError(f"unexpected subprocess call: {args!r}")
+
+        monkeypatch.setattr(claude.subprocess, "run", _boom)
+
+    def test_oauth_token_env_skips_login(self, monkeypatch):
+        # A pre-provisioned CLAUDE_CODE_OAUTH_TOKEN (e.g. `claude setup-token`
+        # output in CI) is the credential Claude Code uses directly, so no
+        # interactive browser login applies — and no `auth status` probe is even
+        # needed. This keeps headless/relayed runs from hanging on the browser.
+        monkeypatch.setenv(claude.CLAUDE_CODE_OAUTH_TOKEN_ENV_VAR, "dummy-oauth-token")
+        self._forbid_subprocess(monkeypatch)
+        claude._ensure_subscription_login()  # returns without touching the CLI
+
+    def test_existing_login_skips_browser(self, monkeypatch):
+        monkeypatch.delenv(claude.CLAUDE_CODE_OAUTH_TOKEN_ENV_VAR, raising=False)
+        monkeypatch.setattr(claude, "_has_subscription_login", lambda: True)
+
+        def _boom(cmd, **kwargs):
+            raise AssertionError(f"no auth login expected, got {cmd!r}")
+
+        monkeypatch.setattr(claude.subprocess, "run", _boom)
+        claude._ensure_subscription_login()
+
+    def test_missing_login_runs_browser_flow(self, monkeypatch):
+        monkeypatch.delenv(claude.CLAUDE_CODE_OAUTH_TOKEN_ENV_VAR, raising=False)
+        monkeypatch.setattr(claude, "_has_subscription_login", lambda: False)
+        calls: list[list[str]] = []
+        monkeypatch.setattr(claude.subprocess, "run", lambda cmd, **kwargs: calls.append(cmd))
+        monkeypatch.setattr(claude, "print_note", lambda *a, **kw: None)
+        monkeypatch.setattr(claude, "print_success", lambda *a, **kw: None)
+        claude._ensure_subscription_login()
+        assert calls == [[claude.SPEC["binary"], "auth", "login"]]
